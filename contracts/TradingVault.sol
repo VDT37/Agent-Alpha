@@ -30,6 +30,19 @@ interface ILlmAgent {
     ) external returns (string memory);
 }
 
+interface IParseAgent {
+    function ExtractString(
+        string calldata key,
+        string calldata description,
+        string[] calldata options,
+        string calldata prompt,
+        string calldata url,
+        bool resolveUrl,
+        uint8 numPages,
+        uint8 confidenceThreshold
+    ) external returns (string memory);
+}
+
 interface IERC20Vault {
     function transfer(address to, uint256 amount) external returns (bool);
     function transferFrom(address from, address to, uint256 amount) external returns (bool);
@@ -47,9 +60,13 @@ contract TradingVault is IAgentRequesterHandler {
     IAgentRequester public immutable platform;
     uint256 public constant JSON_API_AGENT_ID = 13174292974160097713;
     uint256 public constant LLM_AGENT_ID = 12847293847561029384;
+    uint256 public constant PARSE_AGENT_ID = 12875401142070969085;
+
     uint256 public constant SUBCOMMITTEE_SIZE = 3;
     uint256 public constant JSON_PRICE_PER_AGENT = 0.03 ether;
     uint256 public constant LLM_PRICE_PER_AGENT = 0.07 ether;
+    uint256 public constant PARSE_PRICE_PER_AGENT = 0.10 ether;
+
 
     // --- Trading wiring ---
     address public immutable owner;
@@ -64,11 +81,11 @@ contract TradingVault is IAgentRequesterHandler {
     // --- Strategy state ---
     uint256 public lastPrice;
     string public lastDecision; // "buy" / "sell" / "hold" — for your audit trail
-    string public scenario; // owner-injectable context for demos
 
     // --- Callback routing ---
-    enum RequestKind { None, Price, Decision }
+    enum RequestKind { None, Price, News, Decision }
     mapping(uint256 => RequestKind) public requestKind;
+    string public lastSentiment; // for your audit trail
 
     // --- Safety guardrails ---
     bool public paused;
@@ -78,6 +95,7 @@ contract TradingVault is IAgentRequesterHandler {
     event DecisionMade(uint256 indexed requestId, string decision);
     event TradeExecuted(string decision, uint256 amountIn, uint256 amountOut);
     event DecisionSkipped(uint256 indexed requestId, string reason);
+    event NewsAnalyzed(uint256 indexed requestId, string sentiment);
     event Paused(bool status);
 
     modifier onlyOwner() { require(msg.sender == owner, "NOT_OWNER"); _; }
@@ -145,6 +163,8 @@ contract TradingVault is IAgentRequesterHandler {
 
         if (kind == RequestKind.Price) {
             _onPrice(requestId, responses[0].result);
+        } else if (kind == RequestKind.News) {
+            _onNews(requestId, responses[0].result);
         } else if (kind == RequestKind.Decision) {
             _onDecision(requestId, responses[0].result);
         }
@@ -156,42 +176,68 @@ contract TradingVault is IAgentRequesterHandler {
         lastPrice = newPrice;
         emit PriceChecked(requestId, newPrice);
 
-        // Build the prompt. We hand the model the current price and ask for a verdict.
+        string[] memory options = new string[](3);
+        options[0] = "bullish";
+        options[1] = "bearish";
+        options[2] = "neutral";
+
+        bytes memory payload = abi.encodeWithSelector(
+            IParseAgent.ExtractString.selector,
+            "sentiment",                                   // key
+            "Overall market sentiment from the headlines", // description
+            options,                                       // constrained output
+            "Read these crypto news headlines and classify the overall market sentiment.", // prompt
+            "https://www.coindesk.com/",                   // url — pick a stable one
+            true,                                          // resolveUrl
+            uint8(1),                                      // numPages
+            uint8(50)                                      // confidenceThreshold
+        );
+
+        uint256 dep = platform.getRequestDeposit() + PARSE_PRICE_PER_AGENT * SUBCOMMITTEE_SIZE;
+        if (address(this).balance < dep) {
+            emit DecisionSkipped(requestId, "insufficient STT for news call");
+            return;
+        }
+        uint256 newsId = platform.createRequest{value: dep}(
+            PARSE_AGENT_ID, address(this), this.handleResponse.selector, payload
+        );
+        requestKind[newsId] = RequestKind.News;
+    }
+
+    // ---------------- STEP 3: News arrived -> LLM Verdict  ---------------------
+    function _onNews(uint256 requestId, bytes memory result) internal {
+        string memory sentiment = abi.decode(result, (string));
+        lastSentiment = sentiment;
+        emit NewsAnalyzed(requestId, sentiment);
+
         string memory prompt = string.concat(
-            "You are a disciplined crypto trading strategy. The current BTC price is ",
-            _toString(newPrice / 1e8),
-            " USD.",
-            bytes(scenario).length > 0
-                ? string.concat(" Market context: ", scenario, ".")
-                : "",
-            " Respond with exactly one word: buy, sell, or hold. Be conservative: prefer hold unless there is a clear reason."
+            "You are a disciplined crypto trading strategy. BTC price is ",
+            _toString(lastPrice / 1e8),
+            " USD. Current market sentiment from news headlines is: ",
+            sentiment,
+            ". Respond to the market context decisively with exactly one word: buy, sell, or hold."
         );
         string memory system = "You output only one of: buy, sell, hold. No explanation.";
 
         string[] memory allowed = new string[](3);
-        allowed[0] = "buy";
-        allowed[1] = "sell";
-        allowed[2] = "hold";
+        allowed[0] = "buy"; allowed[1] = "sell"; allowed[2] = "hold";
 
         bytes memory payload = abi.encodeWithSelector(
-            ILlmAgent.inferString.selector,
-            prompt, system, false, allowed
+            ILlmAgent.inferString.selector, prompt, system, false, allowed
         );
 
         uint256 dep = platform.getRequestDeposit() + LLM_PRICE_PER_AGENT * SUBCOMMITTEE_SIZE;
-        // NOTE: this spends the vault's own STT balance (see funding note below).
         if (address(this).balance < dep) {
-    emit DecisionSkipped(requestId, "insufficient STT for LLM call");
-    return; // keep the price we already stored; don't revert it
-}
-        
+            emit DecisionSkipped(requestId, "insufficient STT for decision call");
+            return;
+        }
         uint256 decisionId = platform.createRequest{value: dep}(
             LLM_AGENT_ID, address(this), this.handleResponse.selector, payload
         );
         requestKind[decisionId] = RequestKind.Decision;
     }
 
-    // ---------------- STEP 3: AI verdict arrived -> maybe trade ----------------
+    // ---------------- STEP 4: AI verdict arrived -> maybe trade ----------------
     function _onDecision(uint256 requestId, bytes memory result) internal {
         string memory decision = abi.decode(result, (string));
         lastDecision = decision;
@@ -218,7 +264,6 @@ contract TradingVault is IAgentRequesterHandler {
     // ---------------- OWNER CONTROLS ----------------
     function setPaused(bool s) external onlyOwner { paused = s; emit Paused(s); }
     function setMaxTrade(uint256 m) external onlyOwner { maxTradeStable = m; }
-    function setScenario(string calldata s) external onlyOwner { scenario = s; }
 
     // ---------------- helpers ----------------
     function _eq(string memory a, string memory b) internal pure returns (bool) {
