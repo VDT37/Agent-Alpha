@@ -6,7 +6,7 @@ export const addresses = {
   // From deployAmm.js
   amm: "0x3c8825a2e707408365f4fc13c1338046d64ec56f",
   // From deployVault.js
-  vault: "0xa33e34df2aa1d627ee0e20c9d1d8ad0877f10ba7",
+  vault: "0xee132870a6157ea9e053d19a0c496aa9dc00076c",
   // Somnia testnet Agents platform — VERIFY against the Quickstart docs before use.
   platform: "0x037Bb9C718F3f7fe5eCBDB0b600D607b52706776",
 };
