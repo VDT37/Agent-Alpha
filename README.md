@@ -165,4 +165,4 @@ See [scripts/addresses.js](scripts/addresses.js) — mUSD/mETH/AMM are stable; t
 
 ## Demo video
 
-_Link to be added with submission._
+[https://youtu.be/4abbufjuBdQ](https://youtu.be/4abbufjuBdQ)
