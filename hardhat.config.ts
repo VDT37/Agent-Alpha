@@ -1,7 +1,8 @@
-import "@nomicfoundation/hardhat-toolbox-viem";
+import hardhatToolboxViem from "@nomicfoundation/hardhat-toolbox-viem";
 import "dotenv/config";
 
 export default {
+  plugins: [hardhatToolboxViem],
   solidity: "0.8.28",
   networks: {
     somnia: {

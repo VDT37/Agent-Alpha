@@ -1,0 +1,448 @@
+# Autonomous On-Chain Trading Vault — Project Handoff & Build Spec
+
+> **Purpose of this document.** This is a complete, self-contained handoff for finishing an Encode Club / Somnia Agentathon project. It captures everything built so far, every hard-won lesson, and a precise specification for the remaining work (Phase E: volatility-targeted position sizing, plus an optional risk-veto agent, plus the frontend and submission package). It is written so an engineer (or Claude Code) can execute the remaining phases without re-deriving context.
+
+---
+
+## 0. TL;DR — What this project is
+
+An **autonomous on-chain trading vault** built on **Somnia's Agentic L1** (Shannon testnet). Users deposit a stablecoin; the vault runs a fully on-chain, multi-agent decision loop and trades on an AMM. Its defining, judge-facing differentiator:
+
+> **A trading strategy whose entire reasoning is consensus-verified and permanently recorded on-chain — it cannot lie about what data it read or why it traded.** No off-chain bot can make this claim.
+
+The loop chains **three Somnia base agents**:
+
+```
+price (JSON API agent) → news sentiment (LLM Parse Website agent) → decision (LLM Inference agent) → trade on AMM
+```
+
+Phase E adds a **mathematically-grounded position-sizing layer** (volatility targeting + AI conviction scoring via inferNumber), and an optional **risk-veto agent** for agent-to-agent composition.
+
+---
+
+## 1. Why this wins (map to judging criteria)
+
+The Agentathon scores four things. Keep every feature traceable to these:
+
+| Criterion | How this project scores |
+|---|---|
+| **Functionality** (works, deployed, stable) | Tight, proven loop deployed phase-by-phase; in-contract guardrails (pause, max-trade, slippage floor, balance checks) keep it from crashing. |
+| **Agent-First Design** (leverages Agentic L1) | Uses **all three** base agents in a chained, on-chain pipeline; decisions are made *inside contract callbacks*, not by an off-chain bot. Phase E adds `inferNumber` (a 3rd LLM function) and an optional 2nd LLM agent (agent-to-agent). |
+| **Innovation & Technical Creativity** | Verifiable on-chain reasoning trail (the headline); AI-view-plus-deterministic-risk-math architecture; consensus-verified volatility-targeted sizing — genuinely novel vs. the 5 "obvious" Somnia use cases. |
+| **Autonomous Performance** (runs independently, stays stable) | Self-driving callback chain; graceful degradation (skips steps on low fuel instead of reverting); circuit breaker; volatility-aware sizing that self-throttles in turbulent markets. |
+
+**Career context:** this project doubles as the application artifact for Somnia's **Demo Engineer** role, whose JD explicitly lists "trading bot demos … onchain order books and agentic workflows" and "agent-to-agent interactions." Build and narrate accordingly.
+
+---
+
+## 2. Tech stack & environment (CRITICAL — read before coding)
+
+The project runs on a **specific modern stack**. Many examples online assume the older style and will break here.
+
+- **Hardhat 3** with **ESM** (`"type": "module"` in `package.json`) and **viem** (NOT ethers, NOT CommonJS).
+  - Every script starts with `import`, never `require`.
+  - Contract interaction is via viem `publicClient` (reads) and `walletClient` (writes/deploys), reading ABIs through `hre.artifacts.readArtifact`.
+  - Private key needs a `0x`-prefix normalizer.
+- **Solidity 0.8.20**.
+- **Node.js 18+**, **MetaMask** (burner wallet only).
+- **Network — Somnia Shannon testnet:**
+  - Chain ID: `50312`
+  - RPC: `https://dream-rpc.somnia.network`
+  - Explorer: `https://shannon-explorer.somnia.network/`
+  - Native token: **STT** (free from faucets; Google Cloud Web3 faucet for Somnia Shannon is most reliable).
+- **Agents platform contract (testnet):** `0x037Bb9C718F3f7fe5eCBDB0b600D607b52706776`
+  - *Always re-verify against the Quickstart docs before deploying; agents are a prototype and APIs may change.*
+
+### The three base agents
+
+| Agent | ID | Price / validator | Use here |
+|---|---|---|---|
+| JSON API Request | `13174292974160097713` | 0.03 STT | Fetch BTC price from CoinGecko |
+| LLM Inference (Qwen3-30B) | `12847293847561029384` | 0.07 STT | buy/sell/hold decision; Phase E: `inferNumber` conviction |
+| LLM Parse Website | `12875401142070969085` | 0.10 STT | News sentiment (search mode) |
+
+**Subcommittee size:** 3 (platform default). **Deposit formula:** `getRequestDeposit()` (floor) + `pricePerAgent × subcommitteeSize`.
+
+Per-call deposits in practice:
+- JSON API price call: **0.12 STT**
+- LLM Inference call: **0.24 STT**
+- LLM Parse Website call: **0.33 STT**
+- **Full 3-agent loop ≈ 0.57 STT spent from the vault's own balance** (news + decision), plus 0.12 STT attached by the caller for the price call.
+
+---
+
+## 3. The async callback model (the architectural heart)
+
+A smart contract is sealed off from the internet and cannot wait. So agent calls are **asynchronous**:
+
+1. Contract calls `platform.createRequest{value: deposit}(agentId, address(this), this.handleResponse.selector, payload)` → returns a `requestId` immediately. **No answer yet.**
+2. Validators execute the agent off-EVM, reach consensus.
+3. Platform calls your contract's `handleResponse(requestId, responses, status, request)` **later** (~seconds) with the result.
+
+**The decision/trade logic lives inside the callback**, because that's the only moment the data exists.
+
+### Mandatory callback safety (all already implemented)
+- `require(msg.sender == address(platform))` — only the platform may deliver results.
+- Track each request (`mapping requestKind`) and reject unknown `requestId`s.
+- Check `status == Success` **before** decoding — decoding a failed/timed-out response panics.
+- Implement `receive() external payable {}` — unspent deposit is **refunded** to the contract; without `receive()` the refund fails silently and funds stick.
+
+### Chaining = composability
+Each agent's callback fires the next agent's request. This chain (price→news→decision) is the on-chain composability judges reward. Because each later request is fired *from inside a callback the contract makes itself*, **the contract pays those deposits from its own STT balance** — hence the vault must be pre-funded with STT ("fuel"), separate from user trading capital.
+
+---
+
+## 4. CURRENT ARCHITECTURE (Phases A–D, all working)
+
+### Contracts (all deployed & verified on Shannon)
+
+| Contract | Role |
+|---|---|
+| `interfaces/IAgentRequester.sol` | Agent platform interface (Request/Response structs, ResponseStatus enum, handler). Pulled from the Agent Explorer. |
+| `TestToken.sol` | Minimal ERC-20 with open `mint` (testnet). Deployed twice: **mUSD** (stable) and **mETH** (risky). |
+| `SimpleAMM.sol` | Minimal constant-product (`x·y=k`) AMM for the mUSD/mETH pair. Functions: `addLiquidity`, `getAmountOut`, `swap`. 0.3% fee (997/1000). Reentrancy `lock`. This is a deliberately single-pair simplification of Somnia's full Factory/Pair/Router DEX tutorial. |
+| `TradingVault.sol` | The core. Holds deposits, runs the 3-agent chain, sizes & executes trades, enforces guardrails. |
+| `NewsOracle.sol` | Standalone test harness for the Parse Website agent (isolate the news call without the full chain). |
+
+### Deployed token/AMM addresses (stable across redeploys; only the vault redeploys)
+```
+mUSD: 0x36e854719f2a49278431b90278bad6b5afdbd2e5
+mETH: 0x4af60680abf50d37cf917468af105befc76343fa
+AMM seeded at 20,000 mUSD + 10 mETH  → starting price 2000 mUSD/mETH (deep pool = low demo slippage)
+```
+(The vault address changes on every redeploy — see workflow in §6.)
+
+### Scripts (Hardhat 3 / ESM / viem)
+| Script | Job |
+|---|---|
+| `config.js` | **Single source of truth.** Exports `somniaChain`, `account` (with 0x normalizer), `publicClient`, `walletClient`. Owns `dotenv/config`. |
+| `addresses.js` | Central address book (mUSD, mETH, amm, vault, platform). Update vault after each redeploy. |
+| `helpers.js` | `deploy(name, args)` (viem two-step deploy + receipt) and `abiOf(name)`. |
+| `deployTokens.js` | Deploy mUSD + mETH, mint supply. **Run once.** |
+| `deployAmm.js` | Deploy AMM, approve, seed liquidity (sets starting price). **Run once.** |
+| `deployVault.js` | Deploy the vault. **Re-run on every contract change.** |
+| `fundVault.js` | Send STT "fuel" to the vault (3–4 STT recommended). **Re-run after each vault redeploy.** |
+| `deposit.js` | Approve + deposit mUSD into the vault. **Run once per vault.** |
+| `trigger.js` | Fire `checkAndTrade`, walk the 3 callbacks, print the reasoning trail. **Run repeatedly.** |
+| `readState.js` | Free read-only snapshot (price, sentiment, decision, fuel, balances). |
+| `diagnose.js` | Vault fuel + state + bytecode existence (chain-truth, bypasses explorer lag). |
+| `checkAddress.js` | Confirm a contract exists at an address (bytecode vs `0x`). |
+| `testNews.js` | Drive `NewsOracle` against a URL; supports cached oracle to avoid redeploy. |
+| `setScenario.js` | (If scenario feature enabled) inject demo market context. |
+
+### The current vault loop (Phase D, implemented)
+
+```solidity
+// STEP 1 — caller fires this, attaching 0.12 STT
+checkAndTrade()  →  createRequest(JSON_API, fetchUint(CoinGecko BTC/usd, "bitcoin.usd", 8))
+                    requestKind[id] = Price
+
+// STEP 2 — price callback; vault pays ~0.33 STT from its own balance
+_onPrice()       →  store lastPrice
+                    createRequest(PARSE_WEBSITE, ExtractString(... sentiment, search mode ...))
+                    requestKind[id] = News
+
+// STEP 3 — news callback; vault pays ~0.24 STT from its own balance
+_onNews()        →  store lastSentiment
+                    build prompt(price + sentiment)
+                    createRequest(LLM_INFERENCE, inferString(prompt, system, false, [buy,sell,hold]))
+                    requestKind[id] = Decision
+
+// STEP 4 — decision callback
+_onDecision()    →  store lastDecision
+                    if (decision == "buy") _executeTrade()
+
+// trade
+_executeTrade()  →  spend = min(balance, maxTradeStable)   // FLAT CAP — replaced in Phase E
+                    approve AMM, getAmountOut, minOut = 95% (5% slippage floor), swap
+```
+
+### Guardrails (implemented)
+- `paused` circuit breaker (`onlyOwner`).
+- `maxTradeStable` per-trade cap.
+- `minOut` slippage floor (95% of quote) in the swap.
+- Balance checks before firing paid agent calls (emit `DecisionSkipped`, return instead of reverting — graceful degradation).
+
+### Events (the audit trail — the verifiability story lives here)
+`PriceChecked`, `NewsAnalyzed`, `DecisionMade`, `TradeExecuted`, `DecisionSkipped`, `Paused`.
+These are append-only on-chain logs = the permanent, tamper-proof reasoning record. **Anyone** can read them from the chain (viem `getContractEvents`/`getLogs`) and independently verify the vault's history — that's what "verifiable" means here, beyond the contract's own claims. Note Somnia also emits per-agent **receipts** (consensus-verified), so the reasoning was network-verified *before* being recorded.
+
+---
+
+## 5. HARD-WON LESSONS (do not relearn these)
+
+These cost real debugging time. Bake them in.
+
+1. **Hardhat 3 = ESM + viem.** `require`/`hre.ethers` do not exist. Use `import` + viem + `hre.artifacts.readArtifact`. Prefix private key with `0x`.
+2. **Unsaved files run stale code.** Several "bugs" were just an unsaved `.sol`/`.js`. Save before every run.
+3. **The chain is truth; the explorer lags.** A freshly deployed contract can show as an empty EOA / 0 txns for minutes ("98% indexed" banner). Verify with `getCode`/`getBalance`/`diagnose.js`, never trust the explorer's counts immediately after a tx.
+4. **A redeployed contract is brand new.** It carries over **nothing** — no funds, no deposits, no fuel, no scenario. After every `deployVault.js`: update `addresses.js`, re-run `fundVault.js`, re-run `deposit.js`.
+5. **Compile vs deploy are different.** Edit a `.sol` → must `compile` **and** `deployVault.js`. Edit only a script → just run it. Deployed contracts are immutable; "fixing" = redeploy + new address.
+6. **Vault fuel ≠ trading capital.** STT (agent fuel, spent autonomously) is architecturally separate from mUSD (user capital). A revert chain taught this: an empty-fuel vault reverted the LLM call *inside* `_onPrice`, which **rolled back the already-stored price** (revert undoes all prior state writes in the call). Pre-fund fuel; check balance before paid calls.
+7. **The standalone tester and the vault are separate contracts.** Proving a Parse call works in `NewsOracle` does nothing for the vault until you **copy the exact params into the vault and redeploy**. Only put combinations into the vault that succeeded standalone, byte-for-byte.
+8. **`confidenceThreshold` is a hard gate.** Parse Website auto-injects a `confidence_score` (0–100); results below `confidenceThreshold` are dropped as "not answerable" (empty result, failed callback). Sentiment is fuzzy — **use 50, not 70.** (A 70 threshold silently killed the vault's news step while the standalone at 50 worked.)
+9. **Parse Website mode:** `resolveUrl=true` → **search** the domain (treats `url` as a domain, `prompt` doubles as the search term, `numPages` = how many found articles to read). `resolveUrl=false` → scrape the exact URL (numPages capped at 1). Search mode is more robust to heavy/JS-bot-protected homepages. The `prompt` should read like a concrete **search query**; put detailed extraction guidance in `description` (description is extraction-only, not used for search).
+10. **Fixed 25s sleeps are a crude wait.** They're fine for the demo, but the heavier 3-page news call can exceed 25s → premature empty read. Production answer: subscribe to the callback **events** instead of sleeping. (Document this; optionally implement.)
+11. **Decimals on-chain.** Solidity has no fractions/decimals/floats and no native `sqrt`. All ratio math must use **fixed-point scaling** (carry a ×1eN factor). Critical for Phase E.
+12. **Demo determinism.** Live news → real (uncontrollable) sentiment, and Qwen at temp=0 is conservative (often "hold"). For on-camera reliability, an owner-set **scenario** string injected into the prompt lets you steer context honestly (the AI still reasons; you control its inputs). Keep both: real news for the honest pipeline, scenario for the deterministic demo shot.
+
+### Known open issues to address during finish
+- **Accounting is simplified:** `deposits[user]` is flat and ignores trading P&L. If the vault holds mUSD+mETH after trades, the ledger can over-claim withdrawable mUSD. **Fix or document.** Proper fix = share-based accounting (mint/burn shares vs. total pot value). For the hackathon, documenting it as a known limitation is acceptable; share accounting is a stretch goal.
+- **News step flakiness:** a prompt change introduced noise in sentiment extraction. Re-verify the exact vault `_onNews` params against a standalone `NewsOracle` run that succeeds, byte-for-byte, before relying on it. Prefer a concrete search-query `prompt` + rich `description`, `numPages: 3`, `confidenceThreshold: 50`.
+
+---
+
+## 6. STANDARD WORKFLOWS (copy/paste)
+
+**First-time infra (once):**
+```bash
+npx hardhat run scripts/deployTokens.js --network somnia   # → paste mUSD,mETH into addresses.js
+npx hardhat run scripts/deployAmm.js   --network somnia    # → paste amm into addresses.js
+```
+
+**After ANY vault contract change:**
+```bash
+npx hardhat compile
+npx hardhat run scripts/deployVault.js --network somnia    # → paste new vault into addresses.js
+npx hardhat run scripts/fundVault.js   --network somnia    # 3–4 STT fuel
+npx hardhat run scripts/deposit.js     --network somnia    # mUSD capital (once per vault)
+```
+
+**Test the loop (repeatable):**
+```bash
+npx hardhat run scripts/trigger.js     --network somnia
+npx hardhat run scripts/readState.js   --network somnia    # free peek; re-run if a callback is slow
+```
+
+**Diagnose:**
+```bash
+npx hardhat run scripts/diagnose.js    --network somnia
+```
+
+---
+
+## 7. PHASE E — Volatility-Targeted Position Sizing + AI Conviction (THE NEXT BUILD)
+
+**Goal:** replace the flat `maxTradeStable` cap with a **mathematically-grounded, self-throttling position size** = volatility targeting × AI conviction. This is the rigor upgrade that impresses supervisors and is citable to quant literature (volatility targeting is hedge-fund standard; conviction scaling is conviction-weighted sizing).
+
+### 7.1 The math (decided approach)
+
+**Position size formula:**
+```
+base_fraction      = target_vol / current_vol            (capped at 1.0 = 100% capital, no leverage)
+conviction_mult    = conviction / 100                     (AI output 0–100 → 0.0–1.0)
+final_fraction     = base_fraction × conviction_mult      (∈ [0,1])
+trade_size (mUSD)  = final_fraction × available_capital   (then clamp ≤ maxTradeStable as a hard ceiling)
+```
+
+**Architecture principle (state this in the README):** *The AI provides the directional view/conviction; deterministic on-chain math provides the risk-adjusted sizing.* This separation mirrors real systematic funds and is more defensible than letting the LLM size trades directly.
+
+**Volatility measure = average absolute return (chosen over std-dev to avoid an on-chain `sqrt`).**
+Given the last N stored prices `p[0..N-1]`:
+```
+for each consecutive pair: r_i = |p[i] - p[i-1]| / p[i-1]      (absolute % move)
+current_vol = average(r_i)                                      (mean absolute return)
+```
+This is a legitimate, defensible volatility proxy (mean absolute deviation of returns) — ~80% of the rigor of std-dev, no square root, integer-friendly. Cite it as "mean absolute return volatility."
+
+`target_vol` = a chosen constant (e.g. a per-update target like 1% expressed in fixed-point). Tune so realistic markets give sensible fractions.
+
+### 7.2 Fixed-point arithmetic (the on-chain decimals problem)
+
+Solidity has no decimals. Carry a scale factor `SCALE = 1e18` (reuse token-decimals convention) so fractions are big integers.
+
+Worked example (using `SCALE = 1e18`, prices in 8-decimals as currently stored):
+```
+Say recent abs returns are 0.4%, 0.6%, 0.5%  → in fixed point (×1e18): 4e15, 6e15, 5e15
+current_vol = (4e15 + 6e15 + 5e15) / 3 = 5e15           // = 0.005 = 0.5%
+target_vol  = 1e16                                       // = 0.01 = 1.0%
+
+base_fraction = target_vol * SCALE / current_vol
+              = 1e16 * 1e18 / 5e15 = 2e18                // = 2.0  → CAP at 1e18 (=1.0)
+
+conviction = 80 (from inferNumber)
+conviction_mult = 80 * SCALE / 100 = 8e17               // = 0.8
+
+final_fraction = base_fraction(capped 1e18) * conviction_mult / SCALE
+               = 1e18 * 8e17 / 1e18 = 8e17               // = 0.8
+
+trade_size = available_capital * final_fraction / SCALE  // 80% of capital
+           = min(trade_size, maxTradeStable)             // hard ceiling
+```
+**Rules:** multiply before dividing (preserve precision); divide out one `SCALE` per multiplication of two scaled numbers; clamp `base_fraction` to `SCALE` (1.0) so the vault never tries to lever > 100%.
+
+### 7.3 Contract changes (`TradingVault.sol`)
+
+**New state:**
+```solidity
+uint256[] public priceHistory;        // rolling recent prices (8-decimals, as stored)
+uint8 public constant HISTORY_LEN = 8; // keep last N (tune 5–10)
+uint256 public constant SCALE = 1e18;
+uint256 public targetVolFP = 1e16;     // 1.0% target, fixed-point (owner-tunable)
+uint256 public lastConviction;         // AI output 0–100, for the audit trail
+uint256 public lastVolFP;              // computed volatility, for the audit trail
+uint256 public lastTradeFractionFP;    // final fraction used, for the audit trail
+```
+
+**New interface (LLM inferNumber) — VERIFY signature against the Agent Explorer before coding:**
+```solidity
+interface ILlmAgentNumber {
+    function inferNumber(
+        string calldata prompt,
+        string calldata system,
+        int256 minValue,
+        int256 maxValue,
+        bool chainOfThought
+    ) external returns (int256);
+}
+```
+*(Per the LLM Inference agent notes: inferNumber params are prompt, system, minValue, maxValue, chainOfThought → returns int256. Confirm order/types in the Explorer, same as we confirmed inferString.)*
+
+**`_onPrice` change:** after storing `lastPrice`, push to `priceHistory` (ring buffer; drop oldest beyond `HISTORY_LEN`). Then fire the news call as today.
+
+**`_onNews` change:** instead of `inferString` buy/sell/hold, fire `inferNumber` asking for **conviction 0–100** for going long, given price + sentiment. Example prompt:
+```
+"You are a disciplined crypto trading strategy. BTC price is {price} USD.
+News sentiment is: {sentiment}. Output a single integer 0-100 representing your
+conviction to BUY BTC now (0 = no conviction / avoid, 100 = maximum conviction).
+Be decisive and respond to the market context."
+system: "Output only an integer 0-100. No words."
+minValue: 0, maxValue: 100, chainOfThought: false
+```
+Set `requestKind = Decision`.
+
+**`_onDecision` change:** decode the int256 conviction; store `lastConviction`. Compute volatility from `priceHistory` (mean absolute return, fixed-point). Compute `final_fraction` per §7.2. If `final_fraction > 0` and conviction above a minimum floor (e.g. ≥ a tunable `minConviction`, default ~55, to avoid noise trades), call `_executeSizedTrade(final_fraction)`.
+
+**New `_executeSizedTrade(uint256 fractionFP)`:**
+```solidity
+function _executeSizedTrade(uint256 fractionFP) internal {
+    uint256 available = stable.balanceOf(address(this));
+    if (available == 0 || fractionFP == 0) return;
+    uint256 spend = available * fractionFP / SCALE;         // fixed-point apply
+    if (spend > maxTradeStable) spend = maxTradeStable;     // hard ceiling
+    if (spend == 0) return;
+    stable.approve(address(amm), spend);
+    uint256 expectedOut = amm.getAmountOut(address(stable), spend);
+    uint256 minOut = (expectedOut * 95) / 100;              // 5% slippage floor
+    uint256 received = amm.swap(address(stable), spend, minOut);
+    emit SizedTradeExecuted(lastConviction, lastVolFP, fractionFP, spend, received);
+}
+```
+
+**Volatility helper (mean absolute return, fixed-point):**
+```solidity
+function _computeVolFP() internal view returns (uint256 volFP) {
+    uint256 n = priceHistory.length;
+    if (n < 2) return targetVolFP; // not enough history → neutral (size at target)
+    uint256 sumAbsRetFP = 0;
+    for (uint256 i = 1; i < n; i++) {
+        uint256 prev = priceHistory[i-1];
+        uint256 cur  = priceHistory[i];
+        uint256 diff = cur > prev ? cur - prev : prev - cur;
+        // abs return in fixed-point: diff/prev scaled by SCALE
+        sumAbsRetFP += diff * SCALE / prev;
+    }
+    volFP = sumAbsRetFP / (n - 1);
+    if (volFP == 0) volFP = 1; // avoid div-by-zero downstream
+}
+```
+
+**Sizing helper:**
+```solidity
+function _sizeFractionFP(uint256 convictionPct) internal returns (uint256) {
+    uint256 volFP = _computeVolFP();
+    lastVolFP = volFP;
+    uint256 baseFractionFP = targetVolFP * SCALE / volFP;   // target/current, scaled
+    if (baseFractionFP > SCALE) baseFractionFP = SCALE;     // cap at 1.0 (no leverage)
+    uint256 convMultFP = convictionPct * SCALE / 100;       // 0..1.0
+    uint256 finalFP = baseFractionFP * convMultFP / SCALE;  // combine
+    lastTradeFractionFP = finalFP;
+    return finalFP;
+}
+```
+
+**New events / owner controls:**
+```solidity
+event SizedTradeExecuted(uint256 conviction, uint256 volFP, uint256 fractionFP, uint256 amountIn, uint256 amountOut);
+event ConvictionScored(uint256 indexed requestId, uint256 conviction);
+function setTargetVol(uint256 fp) external onlyOwner { targetVolFP = fp; }
+function setMinConviction(uint256 c) external onlyOwner { minConviction = c; }
+```
+
+**Funding note:** Phase E still spends from vault fuel for news + decision calls (~0.57 STT/loop). `inferNumber` is priced same as `inferString` (LLM agent, 0.07/validator → 0.24 STT). Keep `fundVault.js` at 3–4 STT.
+
+### 7.4 Demo for Phase E
+Conviction is a *number*, which demos far better than buy/sell/hold — show it scaling smoothly:
+- Calm market + bullish news → high conviction, low vol → large position.
+- Same conviction + turbulent history (seed volatile prices) → smaller position (vol throttle visible).
+- Use the `scenario` override to drive conviction high deterministically on camera.
+Log the full trail: **price → sentiment → conviction → computed volatility → final fraction → trade size**. That trail *is* the money shot: an AI view converted by transparent, on-chain math into a risk-sized trade, all verifiable.
+
+### 7.5 Testing Phase E
+1. Write a standalone `inferNumber` tester (mirror `NewsOracle` pattern) to confirm the conviction call returns a clean int 0–100 before wiring into the vault.
+2. Unit-test `_computeVolFP` and `_sizeFractionFP` with known inputs (use the §7.2 worked example as a fixture) — ideally in a Hardhat test so the fixed-point math is provably correct.
+3. Seed `priceHistory` with a few `trigger.js` runs (or an owner test-setter) so volatility is non-trivial, then observe sizing.
+
+---
+
+## 8. DO PHASE E WITH Risk-Veto Agent (agent-to-agent composition)
+
+Add a **second LLM Inference agent** as an independent risk officer that can veto a sized trade — this is the explicit "agent-to-agent" beat judges reward.
+
+- After `_sizeFractionFP`, before executing, fire an `inferString` call: prompt summarizes the proposed trade (size, conviction, vol, sentiment); `allowedValues = ["approve","veto"]`.
+- New `requestKind.Veto`; in its callback, execute the trade only if `"approve"`.
+- Now **two agents must agree** before capital moves → a "trading desk" (analyst + risk officer).
+- Cost: +0.24 STT/loop; +1 callback (~25s). Fund accordingly.
+- **Build only after Phase E core is solid.** It's a small addition on the proven chaining pattern; cut it freely if time-constrained without losing a complete project.
+
+---
+
+## 9. PHASE F — Frontend + Submission Package (REQUIRED to finish)
+
+### 9.1 Frontend (Next.js + wagmi/RainbowKit)
+A clean dashboard that makes the verifiability tangible:
+- **Connect wallet** (RainbowKit) on Somnia Shannon.
+- **Vault panel:** deposit/withdraw mUSD; show vault mUSD/mETH balances and STT fuel.
+- **Live reasoning feed:** subscribe to vault **events** (`PriceChecked`, `NewsAnalyzed`, `ConvictionScored`, `SizedTradeExecuted`) via viem `watchContractEvent`, render as a timeline:
+  `10:32 — BTC $60,420 · sentiment bearish · conviction 72 · vol 0.6% · sized 41% → bought 0.34 mETH`.
+- **"Why did it trade?" detail view:** for each trade, show the full on-chain trail + a note that each agent result was consensus-verified (link to the tx on Shannon Explorer). This is the headline feature — it makes "the strategy can't lie" visible.
+- **Guardrail controls (owner):** pause toggle, maxTrade, targetVol — to demo stability on camera.
+- Stack notes: viem + wagmi; read ABIs from artifacts; same `somniaChain` config. No localStorage in artifacts if any are used.
+
+### 9.2 Event-reader script (independent verification)
+Ship `scripts/auditTrail.js`: pulls the vault's full event history from the chain (`getContractEvents`) and prints the decision/trade log. Demo line: *"Anyone — not just me — can run this against the vault address and get the identical, tamper-proof record."* Strong trust-minimization proof.
+
+### 9.3 README (judge-facing — high leverage)
+Must include, in this order:
+1. One-paragraph pitch (the verifiable-reasoning headline).
+2. Architecture diagram (the 3→4 agent chain + AMM + guardrails).
+3. "How it leverages Somnia's Agentic L1" (all 3 base agents, inferNumber, consensus-verified receipts, on-chain reasoning, async callbacks, refunds).
+4. The Phase E math, with the formula and a citation to volatility targeting / conviction sizing; explicitly state the AI-view-vs-deterministic-risk-math separation.
+5. Guardrails & stability story (pause, caps, slippage floor, graceful degradation, vol throttle).
+6. **Known limitations, stated honestly:** flat deposit accounting (no P&L share accounting yet); off-chain keeper for triggering (see below); single news source; fixed-sleep test scripts vs. event subscription. Judges reward honest, well-understood limitations.
+7. Roadmap: share-based accounting, decentralized keeper (Gelato / Somnia reactivity), multi-source news consensus, risk-veto agent.
+8. Setup/run instructions (the §6 workflows), addresses, and a link to the demo video.
+
+### 9.4 Keeper (mention, don't over-build)
+A contract can't wake itself. For the hackathon, triggering `checkAndTrade` **manually / via a local script is fine for the demo**. State in README that production would use a **scheduled trigger** — GitHub Actions cron (free, in-repo) or a decentralized keeper (Gelato / Chainlink Automation), or Somnia's **reactivity** precompile for the most agent-native option. The keeper is intentionally a *dumb clock*: all intelligence/guardrails live in the verified contract, so autonomy is not compromised. Do **not** use a heavyweight AI-agent runtime as the keeper (overkill, competes with the on-chain brain, adds risk).
+
+
+---
+
+## 10. Quick reference — invariants & gotchas checklist
+
+- [ ] Hardhat 3 / ESM / viem only. `import`, not `require`. 0x-prefix the key.
+- [ ] After vault redeploy: update `addresses.js` → `fundVault.js` → `deposit.js`.
+- [ ] Vault needs STT **fuel** (3–4 STT) separate from mUSD capital.
+- [ ] `confidenceThreshold = 50` for news; search mode (`resolveUrl=true`); concrete query in `prompt`, detail in `description`.
+- [ ] Only put standalone-verified agent params into the vault.
+- [ ] Check `status == Success` before decoding; `receive()` present; balance-check before paid calls.
+- [ ] Fixed-point: multiply before divide; cap base fraction at 1.0; one SCALE out per scaled multiply.
+- [ ] Verify `inferNumber` signature in the Agent Explorer before coding it.
+- [ ] Trust `diagnose.js`/chain reads over the explorer's lagging counts.
+- [ ] Save files before running. (Seriously.)
+- [ ] README states known limitations honestly; repo public; demo video linked.
+
+---
+
+*End of handoff. The pipeline (Phases A–D) is proven and working. Phase E is fully specified above with the chosen volatility-targeting + conviction approach and the fixed-point math worked out.*

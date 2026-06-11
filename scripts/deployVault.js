@@ -10,6 +10,7 @@
 
 // scripts/deployVault.js
 import { parseEther } from "viem";
+import { publicClient } from "./config.js";
 import { deploy } from "./helpers.js";
 import { addresses } from "./addresses.js";
 
@@ -30,8 +31,11 @@ async function main() {
     MAX_TRADE_STABLE,
   ]);
 
+  const block = await publicClient.getBlockNumber();
   console.log("\n=== PASTE THIS INTO scripts/addresses.js ===");
   console.log(`  vault: "${vault}",`);
+  console.log(`  vaultDeployBlock: ${block},`);
+  console.log("\nThen re-run fundVault.js and deposit.js — a fresh vault carries nothing over.");
 }
 
 main().catch((e) => { console.error(e); process.exitCode = 1; });

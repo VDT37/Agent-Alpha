@@ -5,7 +5,7 @@ import { deploy, abiOf } from "./helpers.js";
 import { addresses } from "./addresses.js";
 
 // Try different URLs here. Re-run with a new one each time — no redeploy needed.
-const TEST_URL = "https://coindesk.com/";
+const TEST_URL = "https://cointelegraph.com/";
 
 const PARSE_FEE = parseEther("0.33"); // from the Explorer
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));

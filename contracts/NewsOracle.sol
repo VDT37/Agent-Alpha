@@ -41,6 +41,7 @@ contract NewsOracle is IAgentRequesterHandler {
 
     // url is a parameter so you can try different sites WITHOUT redeploying.
     function requestSentiment(string calldata url) external payable returns (uint256 requestId) {
+        // inside NewsOracle.sol requestSentiment — updated args
         string[] memory options = new string[](3);
         options[0] = "bullish";
         options[1] = "bearish";
@@ -48,14 +49,14 @@ contract NewsOracle is IAgentRequesterHandler {
 
         bytes memory payload = abi.encodeWithSelector(
             IParseAgent.ExtractString.selector,
-            "sentiment",                                   // key
-            "Overall crypto market sentiment",             // description
-            options,                                       // constrained output
-            "Read these crypto news headlines and classify the overall market sentiment as bullish, bearish, or neutral.", // prompt
-            url,                                           // url (passed in)
-            true,                                          // resolveUrl
-            uint8(1),                                      // numPages
-            uint8(50)                                      // confidenceThreshold (loosened from 70)
+            "market_sentiment",                                              // key
+            "The overall sentiment of the current cryptocurrency market based on recent news.", // description
+            options,                                                         // constrained output
+            "Latest cryptocurrency market news and overall investor sentiment today", // prompt = search term
+            url,                                                             // domain to search (passed in)
+            true,                                                            // resolveUrl = SEARCH mode
+            uint8(3),                                                        // read up to 3 found articles
+            uint8(50)                                                        // confidence gate
         );
 
         uint256 dep = platform.getRequestDeposit() + PARSE_PRICE_PER_AGENT * SUBCOMMITTEE_SIZE;
