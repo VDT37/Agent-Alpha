@@ -41,7 +41,7 @@ Each agent call is **asynchronous**: the contract fires `createRequest` on the S
 - **Consensus-verified reasoning:** every agent result was agreed by a 3-validator subcommittee _before_ the contract acted on it, and is recorded in events (`PriceChecked`, `NewsAnalyzed`, `ConvictionScored`, `VetoRequested`, `SizedTradeExecuted`, …).
 - **Async callback model done safely:** platform-only callback gate, per-request kind tracking, `status == Success` checks before decoding, `receive()` for deposit refunds, balance checks before every paid call.
 
-## The position-sizing math (Phase E)
+## The position-sizing math
 
 > **Principle: the AI provides the directional view and conviction; deterministic on-chain math provides the risk-adjusted sizing.** This separation mirrors real systematic funds — the LLM never picks the trade size directly.
 
